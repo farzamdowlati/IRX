@@ -1,0 +1,9 @@
+# secrets & runtime state — never in the repo
+.env
+config.json
+data/
+*.log
+__pycache__/
+*.pyc
+.DS_Store
+dev/
