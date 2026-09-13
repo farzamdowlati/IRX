@@ -28,6 +28,8 @@ import json, os, sys, time, urllib.request, urllib.parse
 from datetime import datetime, timezone, timedelta
 
 import envcfg as E
+import irx_data
+from irx_data import GRAM_PER_OZ, K18, COIN_GRAM, COIN_PURITY, get_json, pct
 
 TEHRAN = timezone(timedelta(hours=3, minutes=30))
 UA = {"User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -36,17 +38,6 @@ UA = {"User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
 # NOTE: do NOT reuse the browser UA for OpenAI-compatible endpoints — Cloudflare
 # (e.g. Groq) gives error 1010 for spoofed Chrome strings but accepts honest clients.
 LLM_UA = "irx-brief/4.0"
-GRAM_PER_OZ = 31.1034768
-COIN_GRAM, COIN_PURITY = 8.105, 0.900   # full Bahar Azadi / Emami spec
-K18 = 0.75                              # 18k = 75% fine
-
-
-def get_json(url, timeout=25, headers=None):
-    h = dict(UA)
-    if headers: h.update(headers)
-    req = urllib.request.Request(url, headers=h)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode())
 
 
 def post_json(url, payload, timeout=40, headers=None):
@@ -185,51 +176,29 @@ def main():
         sys.exit(0)
     ts = int(time.time())
 
-    # ---------- fetch: Tehran street ----------
-    d = get_json("https://api.brsapi.ir/Market/Gold_Currency.php?key={}".format(E.get("BRS_API_KEY")))
-    brs = {}
-    for grp in ("gold", "currency", "cryptocurrency"):
-        for it in d.get(grp, []):
-            brs[it["symbol"]] = {"price": float(it["price"]), "chg": it.get("change_percent", 0)}
-
-    # ---------- fetch: world XAU (live) ----------
+    # ---------- fetch + compute (single source of truth) ----------
     try:
-        sq = get_json("https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD")
-        mids = [(float(sp["bid"]) + float(sp["ask"])) / 2
-                for src in sq for sp in src.get("spreadProfilePrices", [])]
-        xau, xau_live = round(sum(mids) / len(mids), 2), True
+        row = irx_data.snapshot()
     except Exception as e:
-        sys.stderr.write(f"[warn] Swissquote failed ({e}); using BrsAPI XAUUSD (stale/circular)\n")
-        xau, xau_live = brs["XAUUSD"]["price"], False
+        sys.stderr.write(f"[fatal] market fetch failed: {e}\n")
+        sys.exit(1)
 
-    # ---------- fetch: world crosses (daily) ----------
-    era = None
-    try:
-        e = get_json("https://v6.exchangerate-api.com/v6/{}/latest/USD".format(E.get("ERA_API_KEY")))
-        era = {c: e["conversion_rates"][c] for c in ("CNY", "AED", "EUR")}
-    except Exception as ex:
-        sys.stderr.write(f"[warn] ExchangeRate-API failed: {ex}\n")
-
-    # ---------- compute ----------
-    pct = lambda a, b: (a / b - 1.0) * 100.0
-    px = lambda s: brs[s]["price"]
-    ch = lambda s: brs[s]["chg"]
-
-    usd, usdt, aed, cny, eur = px("USD"), px("USDT_IRT"), px("AED"), px("CNY"), px("EUR")
-    g18, g24, emami, quarter = px("IR_GOLD_18K"), px("IR_GOLD_24K"), px("IR_COIN_EMAMI"), px("IR_COIN_QUARTER")
-    btc, eth, bnb, xrp, sol = px("BTC"), px("ETH"), px("BNB"), px("XRP"), px("SOL")
-
-    imp = {"AED": usd / aed, "CNY": usd / cny, "EUR": usd / eur}
-    gaps = {k: (pct(era[k], v) if era else None) for k, v in imp.items()}
-
-    theo_g = xau * usd / GRAM_PER_OZ          # world-parity 24k gram, Toman
-    theo_18 = theo_g * K18
-    gold_gap, gap18 = pct(g24, theo_g), pct(g18, theo_18)
-    melt_w_em, melt_w_q = theo_g * COIN_GRAM * COIN_PURITY, theo_g * (COIN_GRAM / 4) * COIN_PURITY
-    melt_d_em, melt_d_q = g24 * COIN_GRAM * COIN_PURITY, g24 * (COIN_GRAM / 4) * COIN_PURITY
-    emami_bub, emami_bub_dom = pct(emami, melt_w_em), pct(emami, melt_d_em)
-    qtr_bub, qtr_bub_dom = pct(quarter, melt_w_q), pct(quarter, melt_d_q)
-    tether_prem = pct(usdt, usd)
+    usd, usdt, aed, cny, eur = row["usd"], row["usdt"], row["aed"], row["cny"], row["eur"]
+    g18, g24, emami, quarter = row["g18"], row["g24"], row["emami"], row["quarter"]
+    btc, eth, bnb, xrp, sol = row["btc"], row["eth"], row["bnb"], row["xrp"], row["sol"]
+    xau, xau_live = row["xau_global"], row["xau_live"]
+    era = {c: row["imp_" + c.lower()] * (1 + row["gap_" + c.lower()] / 100.0)
+           for c in ("CNY", "AED", "EUR")} if row.get("gap_cny") is not None else None
+    imp = {"AED": row["imp_aed"], "CNY": row["imp_cny"], "EUR": row["imp_eur"]}
+    gaps = {"AED": row.get("gap_aed"), "CNY": row.get("gap_cny"), "EUR": row.get("gap_eur")}
+    theo_g, gold_gap, gap18 = row["theo_g"], row["gold_gap"], row["gap18"]
+    emami_bub, emami_bub_dom = row["emami_bub"], row["emami_bub_dom"]
+    qtr_bub, qtr_bub_dom = row["qtr_bub"], row["qtr_bub_dom"]
+    tether_prem = row["tether_prem"]
+    _brs_pct = row["brs_chg"]          # BrsAPI's own daily change per symbol
+    ch = lambda s: _brs_pct[s]
+    coin_melt = theo_g * COIN_GRAM * COIN_PURITY
+    qtr_melt = theo_g * (COIN_GRAM / 4) * COIN_PURITY
 
     hist = load_history()
     prev = hist[-1] if hist else None
