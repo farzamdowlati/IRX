@@ -9,11 +9,19 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import threading
 import time
 
 from . import config as C
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
+
+# One connection, many threads. PTB runs sync job callbacks and handlers in worker
+# threads while the event loop keeps its own, so a connection bound to its creating
+# thread raises "SQLite objects created in a thread can only be used in that thread"
+# (hit for real in backfill_bars). check_same_thread=False + a coarse lock keeps the
+# one-writer discipline explicit instead of accidental.
+lock = threading.RLock()
 
 DDL = """
 CREATE TABLE IF NOT EXISTS series (
@@ -53,7 +61,7 @@ def connect(path: str | None = None, fresh: bool = False) -> sqlite3.Connection:
         d = os.path.dirname(p)
         if d:
             os.makedirs(d, exist_ok=True)
-        c = sqlite3.connect(p, timeout=30)
+        c = sqlite3.connect(p, timeout=30, check_same_thread=False)
         c.row_factory = sqlite3.Row
         c.execute("PRAGMA journal_mode=WAL")
         c.execute("PRAGMA synchronous=NORMAL")
@@ -63,6 +71,19 @@ def connect(path: str | None = None, fresh: bool = False) -> sqlite3.Connection:
             _conn = c
         return c
     return _conn
+
+
+def db_path(conn: sqlite3.Connection) -> str:
+    """The file this connection actually points at. Needed because callers must not
+    assume the configured default path (a test DB, or a second instance, lives
+    elsewhere)."""
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+        if row and row["file"]:
+            return row["file"]
+    except sqlite3.Error:
+        pass
+    return C.DB_PATH
 
 
 def init(conn: sqlite3.Connection) -> None:

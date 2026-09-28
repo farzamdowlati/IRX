@@ -1,0 +1,22 @@
+[Unit]
+Description=IRX — Iran market radar (Telegram bot: sampling, pages, alerts)
+Documentation=file:///root/.irx/docs/RESHAPE-PLAN.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/.irx
+# venv python: the stock python3 on tr has no telegram module
+ExecStart=/root/.irx/venv/bin/python -m irx.bot
+Restart=always
+RestartSec=10
+StandardOutput=append:/root/.irx/bot.log
+StandardError=append:/root/.irx/bot.log
+# the bot is the only writer of data/irx.db; give sqlite room to finish a WAL write
+TimeoutStopSec=30
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target

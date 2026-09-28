@@ -207,6 +207,7 @@ ALERT_MOVE_PCT = {
 ALERT_INDEX_PCT = env_float("ALERT_MOVE_INDEX_PCT", 3.0)
 ALERT_COOLDOWN_MIN = env_int("ALERT_COOLDOWN_MIN", 60)
 ALERT_Z = env_float("ALERT_Z", 3.0)
+ALERT_EVERY_SEC = env_int("ALERT_EVERY_SEC", 300)      # how often rules are evaluated
 
 # ---------------------------------------------------------------- cadence
 INTL_INTERVAL_MIN = env_int("INTL_INTERVAL_MIN", 5)
