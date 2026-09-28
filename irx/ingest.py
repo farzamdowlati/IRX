@@ -73,7 +73,8 @@ def run_intl(conn, now: float | None = None, crosscheck: bool = True) -> dict:
             stale = bool(o.get("stale")) or (
                 src_age is not None and src_age > _STALE_FACTOR * C.INTL_INTERVAL_MIN * 60)
             S.record(conn, res["id"], o["value"], ts=ts, src_ts=o.get("src_ts"),
-                     source=o["source"], stale=stale)
+                     source=o["source"], stale=stale,
+                     day_pct=(o.get("extra") or {}).get("day_pct"))
             for x in o.get("crosschecks", []) or []:
                 S.record(conn, "%s@%s" % (res["id"], x["provider"]), x["value"], ts=ts,
                          src_ts=x.get("src_ts"), source=x["source"], stale=bool(x.get("stale")))
@@ -112,7 +113,7 @@ def run_iran(conn, now: float | None = None) -> dict:
             S.bump_failures(conn, s["id"])
             continue
         S.record(conn, s["id"], it["price"], ts=ts, src_ts=it.get("t"), source="brsapi",
-                 stale=out["src_frozen"])
+                 stale=out["src_frozen"], day_pct=it.get("chg"))
         S.clear_failures(conn, s["id"])
         out["ok"] += 1
     try:
@@ -165,3 +166,38 @@ def backfill_bars(conn, intervals=("5m", "15m", "1h"), count: int = 500) -> dict
 
 def prune(conn) -> dict:
     return S.prune(conn)
+
+
+def record_gaps(conn, now: float | None = None) -> int:
+    """Persist the derived series the analysis pages depend on: parity gaps, gold/coin
+    premiums, the tether premium and the triangulation consensus/dispersion.
+
+    Without this there is nothing for the half-life (D2) and gap z-score (D3/D11)
+    statistics to be computed FROM — they would stay permanently empty.
+    """
+    from .analysis import cross
+
+    now = now or time.time()
+    ts = _grid(now, C.IRAN_INTERVAL_MIN)
+    n = 0
+    for g in cross.parity_gaps(conn):
+        if S.record(conn, "gap:%s" % g["label"], g["gap_pct"], ts=ts, source="derived"):
+            n += 1
+    gp = cross.gold_parity(conn)
+    if gp:
+        for key, val in (("gap:gold", gp.get("gap_pct")),
+                         ("gap:coin", gp.get("coin_premium_pct")),
+                         ("gap:melt_purity", gp.get("melt_purity"))):
+            if val is not None and S.record(conn, key, val, ts=ts, source="derived"):
+                n += 1
+    tp = cross.tether_premium(conn)
+    if tp is not None and S.record(conn, "gap:tether", tp, ts=ts, source="derived"):
+        n += 1
+    tri = cross.triangulation(conn)
+    if tri:
+        if S.record(conn, "tri:consensus", tri["consensus"], ts=ts, source="derived"):
+            n += 1
+        if S.record(conn, "tri:dispersion", tri["dispersion_mad_pct"], ts=ts,
+                    source="derived"):
+            n += 1
+    return n

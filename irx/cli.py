@@ -104,6 +104,20 @@ def cmd_prune(args):
     return 0
 
 
+def cmd_pages(args):
+    """Render pages to stdout — the offline curation check before anything is sent."""
+    from .render import pages as P
+    conn = S.connect()
+    now = time.time()
+    if args.only:
+        print(P.render(conn, args.only, now))
+        return 0
+    for page in P.PAGE_ORDER:
+        print("\n" + "=" * 30 + " %s " % page + "=" * 30)
+        print(P.render(conn, page, now))
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="irx")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -124,6 +138,10 @@ def main(argv=None):
     sub.add_parser("coverage").set_defaults(fn=cmd_coverage)
     sub.add_parser("health").set_defaults(fn=cmd_health)
     sub.add_parser("prune").set_defaults(fn=cmd_prune)
+
+    pg = sub.add_parser("pages")
+    pg.add_argument("--only", choices=("prices", "ohlc", "cross", "trend"), default=None)
+    pg.set_defaults(fn=cmd_pages)
 
     args = p.parse_args(argv)
     return args.fn(args)

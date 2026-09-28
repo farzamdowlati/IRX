@@ -96,7 +96,17 @@ def tether_premium(conn) -> float | None:
 
 
 def triangulation(conn) -> dict | None:
-    """D1: every dollar leg, one consensus, one dispersion gauge."""
+    """D1: every dollar leg, one consensus, one dispersion gauge.
+
+    One leg per INSTRUMENT, not per venue: USDT is quoted by both BrsAPI and Wallex,
+    but counting it twice would double-weight tether in the median. The second venue
+    lives in the store as USDTIRT@wallex and is surfaced as a venue gap instead.
+
+    Read the two dispersion numbers together: MAD is robust, so a SINGLE dislocated
+    leg barely moves it (medians ignore outliers) while `spread_pct` and each leg's
+    own `dev_pct` jump — that pairing is deliberate, MAD measures general
+    fragmentation and spread names the outlier.
+    """
     usd = _v(conn, "USDIRT")
     usdt = _v(conn, "USDTIRT")
     g18 = _v(conn, "G18")

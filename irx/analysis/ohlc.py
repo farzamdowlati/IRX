@@ -64,6 +64,35 @@ def day_bounds(ts: float, session: str) -> tuple:
         return start, start + 86400
 
 
+def prev_close(conn, series_id: str, session: str, now: float) -> float | None:
+    """The close that 'today's change' is measured against: the last value before the
+    market's own day began. Prefers our own samples, falls back to backfilled bars
+    (which is the normal case for the world series on day one)."""
+    start, _ = day_bounds(now, session)
+    r = S.at_or_before(conn, series_id, start)
+    if r and r["value"] is not None:
+        return r["value"]
+    for iv in ("5m", "15m", "1h"):
+        b = S.get_bars(conn, series_id, iv, until=start, limit=1)
+        if b and b[-1].get("c") is not None:
+            return b[-1]["c"]
+    return None
+
+
+def day_change(conn, series_id: str, session: str, last_value: float,
+               now: float) -> float | None:
+    """Percent change since the previous close, computed by us so every row on a page
+    uses one definition. Falls back to the source's own daily figure only when we have
+    no previous close yet (first day after a fresh install)."""
+    pc = prev_close(conn, series_id, session, now)
+    if pc:
+        return (last_value / pc - 1.0) * 100.0
+    r = S.latest(conn, series_id)
+    if r and r.get("day_pct") is not None:
+        return float(r["day_pct"])
+    return None
+
+
 def summary(conn, series_id: str, now: float | None = None) -> dict | None:
     """Today's OHLC + previous close for one series, or None when there is no data."""
     now = now or time.time()

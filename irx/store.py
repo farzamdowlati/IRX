@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS series (
 );
 CREATE TABLE IF NOT EXISTS sample (
   series_id TEXT NOT NULL, ts INTEGER NOT NULL, value REAL, src_ts INTEGER,
-  source TEXT, stale INTEGER DEFAULT 0,
+  source TEXT, stale INTEGER DEFAULT 0, day_pct REAL,
   PRIMARY KEY (series_id, ts)
 );
 CREATE INDEX IF NOT EXISTS sample_ts ON sample(ts);
@@ -73,23 +73,40 @@ def init(conn: sqlite3.Connection) -> None:
         "session=excluded.session, unit=excluded.unit, label=excluded.label",
         [(s["id"], s["group"], (s["sources"][0][0] if s["sources"] else None), None,
           s["session"], s["unit"], s["label"]) for s in C.SERIES])
+    _migrate(conn)
     set_meta(conn, "schema_version", SCHEMA_VERSION)
     conn.commit()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """CREATE TABLE IF NOT EXISTS cannot add a column to an existing DB, and an
+    existing DB is the normal case on the VPS. Add columns explicitly."""
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(sample)")}
+    if "day_pct" not in have:
+        conn.execute("ALTER TABLE sample ADD COLUMN day_pct REAL")
 
 
 # ------------------------------------------------------------------ samples
 def record(conn, series_id: str, value: float | None, ts: int | None = None,
            src_ts: int | None = None, source: str | None = None,
-           stale: bool = False) -> bool:
-    """Insert/replace one observation. Returns False for a None value."""
+           stale: bool = False, day_pct: float | None = None) -> bool:
+    """Insert/replace one observation. Returns False for a None value.
+
+    `day_pct` is the SOURCE's own daily change, kept for cross-checking only — the
+    rendered day change is computed from our own previous close so every row on the
+    page uses one definition.
+    """
     if value is None:
         return False
     ts = int(ts or time.time())
     conn.execute(
-        "INSERT INTO sample(series_id, ts, value, src_ts, source, stale) VALUES(?,?,?,?,?,?) "
+        "INSERT INTO sample(series_id, ts, value, src_ts, source, stale, day_pct) "
+        "VALUES(?,?,?,?,?,?,?) "
         "ON CONFLICT(series_id, ts) DO UPDATE SET value=excluded.value, "
-        "src_ts=COALESCE(excluded.src_ts, src_ts), source=excluded.source, stale=excluded.stale",
-        (series_id, ts, float(value), int(src_ts) if src_ts else None, source, 1 if stale else 0))
+        "src_ts=COALESCE(excluded.src_ts, src_ts), source=excluded.source, "
+        "stale=excluded.stale, day_pct=COALESCE(excluded.day_pct, day_pct)",
+        (series_id, ts, float(value), int(src_ts) if src_ts else None, source,
+         1 if stale else 0, day_pct))
     conn.commit()
     return True
 
