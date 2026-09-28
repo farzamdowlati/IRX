@@ -128,36 +128,65 @@ def prices(conn, now: float | None = None) -> str:
 
 
 # ----------------------------------------------------------------------- ohlc
-def ohlc_page(conn, now: float | None = None) -> str:
+def _abbr(v, dp: int = 2) -> str:
+    """Compact number for the narrow text fallback: exact below 100k, K/M above
+    (same rule as the image renderer)."""
+    if v is None:
+        return "—"
+    a = abs(v)
+    if a >= 1e6:
+        return "%.2fM" % (v / 1e6)
+    if a >= 1e5:
+        return "%.1fK" % (v / 1e3)
+    return "{:,.{}f}".format(v, dp)
+
+
+def ohlc_caption(conn, now: float | None = None) -> str:
+    """Caption for the OHLC IMAGE. Kept short: Telegram caps media captions at 1024
+    characters, and the table itself is in the picture."""
     now = now or time.time()
-    lines = ["%-*s%*s%*s%*s%*s%*s" % (LBL_W, "series", 11, "open", 11, "high", 11, "low",
-                                     11, "close", 8, "range")]
-    n_world = n_own = 0
-    for _title, ids in _GROUPS:
+    counts = {"world": 0, "iran": 0}
+    for sid, spec in C.BY_ID.items():
+        if spec.get("render", True) and ohlc.summary(conn, sid, now):
+            counts["iran" if spec["group"] == "iran" else "world"] += 1
+    return ("📈 <b>OHLC</b> · today, in each market's own day · %s\n"
+            "<i>O/H/L/C then range = (high−low)/open · ● open ○ closed · "
+            "K = thousand, M = million\n"
+            "world: the feed's own candles (%d series) · Tehran: our 15-min samples "
+            "(%d series, thin until history builds)</i>"
+            % (_tehran(now), counts["world"], counts["iran"]))
+
+
+def ohlc_page(conn, now: float | None = None) -> str:
+    """NARROW TEXT FALLBACK, used only when the PNG renderer is unavailable.
+
+    Four wide columns cannot fit a phone (they wrap and the table collapses), so each
+    series gets a three-line block: the label, then O/H, then L/C. Every line stays
+    under 30 characters, which is the only way a monospace block survives a phone's
+    line width. The image path (render/imagetable.py) is the primary one.
+    """
+    now = now or time.time()
+    out = ["📈 <b>OHLC</b> · today · <i>O/H/L/C, K = thousand, M = million</i>"]
+    for title, ids in _GROUPS:
+        blocks = []
         for sid in ids:
             spec = C.BY_ID.get(sid)
-            if not spec:
-                continue
-            s = ohlc.summary(conn, sid, now)
+            s = ohlc.summary(conn, sid, now) if spec else None
             if not s:
                 continue
-            dp = spec.get("dp", 2)
-            lines.append("%s%*s%*s%*s%*s%*s" % (
-                _pad_label(spec["label"]), 11, _num(s["open"], dp), 11, _num(s["high"], dp),
-                11, _num(s["low"], dp), 11, _num(s["close"], dp),
-                8, ("%.2f%%" % s["range_pct"]) if s.get("range_pct") is not None else "—"))
-            if sid in C.IRAN_IDS:
-                n_own += 1
-            else:
-                n_world += 1
-    body = "\n".join(lines)
-    foot = ["", "📈 <b>OHLC</b> · today, in each market's own day"]
-    foot.append("<pre>" + body + "</pre>")
-    foot.append("<i>world bars come from the feed's own 5-min candles (%d series); "
-                "Tehran has no candle feed, so its OHLC is aggregated from our own "
-                "15-min samples (%d series, thin until history builds). <b>range</b> = "
-                "(high−low)/open.</i>" % (n_world, n_own))
-    return "\n".join(foot)
+            p = spec.get("dp", 2)
+            badge = "" if M.schedule_open(spec["session"], now) else " ⏸"
+            blocks.append("%s%s\n  O %s  H %s\n  L %s  C %s" % (
+                _abbr_label(spec["label"]), badge, _abbr(s["open"], p), _abbr(s["high"], p),
+                _abbr(s["low"], p), _abbr(s["close"], p)))
+        if blocks:
+            out.append("◆ <b>%s</b>" % h(title))
+            out.append("<pre>" + "\n".join(blocks) + "</pre>")
+    return "\n".join(out)
+
+
+def _abbr_label(label: str, width: int = 16) -> str:
+    return label if len(label) <= width else label[:width - 1] + "…"
 
 
 # ---------------------------------------------------------------------- cross
@@ -238,8 +267,6 @@ def cross_page(conn, now: float | None = None) -> str:
 def trend_page(conn, now: float | None = None, hours: float = 24.0) -> str:
     now = now or time.time()
     out = ["📉 <b>Trend · last %dh</b> · %s" % (hours, _tehran(now)), ""]
-    out.append("<i>deterministic: OLS slope ÷ the asset's own measured step noise, "
-               "gated by efficiency ratio. Same history, same verdict. No LLM.</i>")
     for title, ids in _GROUPS:
         rows = []
         for sid in ids:

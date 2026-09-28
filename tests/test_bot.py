@@ -40,7 +40,7 @@ class FakeBot:
     without awaiting silently does nothing."""
 
     def __init__(self, not_modified=False):
-        self.sent, self.edits = [], []
+        self.sent, self.edits, self.photos, self.media_edits, self.deleted = [], [], [], [], []
         self.not_modified = not_modified
 
     async def send_message(self, **kw):
@@ -51,6 +51,20 @@ class FakeBot:
         if self.not_modified:
             raise BadRequest("Message is not modified")
         self.edits.append(kw)
+        return True
+
+    async def send_photo(self, **kw):
+        self.photos.append(kw)
+        return FakeMessage()
+
+    async def edit_message_media(self, **kw):
+        if self.not_modified:
+            raise BadRequest("Message is not modified")
+        self.media_edits.append(kw)
+        return True
+
+    async def delete_message(self, chat_id=None, message_id=None):
+        self.deleted.append((chat_id, message_id))
         return True
 
 
@@ -170,18 +184,78 @@ class TestBotLogic(unittest.IsolatedAsyncioTestCase):
         from irx.render import pages as P
         self.assertFalse(P.all_closed(self.c, P.PAGE_PRICES, FRIDAY_NIGHT))
 
+    # ------------------------------------------------------- the OHLC image page
+    async def test_ohlc_page_is_delivered_as_a_photo(self):
+        from irx.bot import send_page
+        from irx import bot as botmod
+        if not botmod.imagetable.available():
+            self.skipTest("no image renderer on this host")
+        bot = FakeBot()
+        self.assertEqual(await send_page(bot, self.c, 7, "ohlc", self.now), "sent")
+        self.assertEqual(len(bot.photos), 1)
+        self.assertEqual(bot.sent, [])                      # image, not text
+        self.assertTrue(bot.photos[0]["caption"].startswith("📈"))
+
+    async def test_switching_between_text_and_photo_resends_and_cleans_up(self):
+        """Telegram cannot edit a text message into a photo, so the type change must
+        post the new message first and delete the old one after."""
+        from irx.bot import send_page
+        from irx import bot as botmod
+        if not botmod.imagetable.available():
+            self.skipTest("no image renderer on this host")
+        bot = FakeBot()
+        await send_page(bot, self.c, 7, "prices", self.now)          # text
+        first = S.get_chat(self.c, 7)["msg_id"]
+        self.assertEqual(await send_page(bot, self.c, 7, "ohlc", self.now), "sent")
+        self.assertEqual(len(bot.photos), 1)
+        self.assertIn((7, first), bot.deleted)              # old text cleaned up
+        photo_id = S.get_chat(self.c, 7)["msg_id"]
+        self.assertNotEqual(photo_id, first)
+        # and back to text
+        self.assertEqual(await send_page(bot, self.c, 7, "cross", self.now), "sent")
+        self.assertEqual(len(bot.sent), 2)                  # prices + cross (2 texts)
+        self.assertIn((7, photo_id), bot.deleted)
+
+    async def test_edits_the_photo_in_place_when_already_a_photo(self):
+        from irx.bot import send_page
+        from irx import bot as botmod
+        if not botmod.imagetable.available():
+            self.skipTest("no image renderer on this host")
+        bot = FakeBot()
+        await send_page(bot, self.c, 7, "ohlc", self.now)
+        S.record(self.c, "WTI", 123.45, ts=self.now, source="test")
+        self.assertEqual(await send_page(bot, self.c, 7, "ohlc", self.now), "edited")
+        self.assertEqual(len(bot.photos), 1)
+        self.assertEqual(len(bot.media_edits), 1)
+        self.assertEqual(bot.deleted, [])
+
+    async def test_ohlc_falls_back_to_text_without_a_renderer(self):
+        from irx.bot import send_page
+        from irx import bot as botmod
+        real = botmod.imagetable.render_ohlc
+        botmod.imagetable.render_ohlc = lambda conn, now: None
+        try:
+            bot = FakeBot()
+            await send_page(bot, self.c, 7, "ohlc", self.now)
+            self.assertEqual(bot.photos, [])
+            self.assertEqual(len(bot.sent), 1)
+            self.assertIn("OHLC", bot.sent[0]["text"])
+        finally:
+            botmod.imagetable.render_ohlc = real
+
     # ------------------------------------------------------------- whitelist
     def test_whitelist_migration_imports_the_v1_file_once(self):
         import json
         from irx.bot import migrate_whitelist
+        # fake ids only: the real owner chat id must never reach a public repo
         wl = os.path.join(os.path.dirname(self.path), "whitelist.json")
         with open(wl, "w") as f:
-            json.dump([270305392, 999], f)
+            json.dump([555000111, 999], f)
         try:
             self.assertEqual(migrate_whitelist(self.c), 2)
             self.assertEqual(migrate_whitelist(self.c), 0)   # idempotent
             ids = sorted(x["chat_id"] for x in S.chats(self.c))
-            self.assertEqual(ids, [999, 270305392])
+            self.assertEqual(ids, [999, 555000111])
         finally:
             os.unlink(wl)
 

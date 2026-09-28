@@ -26,7 +26,8 @@ import json
 import logging
 import time
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto,
+                      Update)
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
@@ -34,6 +35,7 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
 
 from . import config as C, ingest, store as S
 from .analysis import alerts
+from .render import imagetable
 from .render import pages as P
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -112,53 +114,113 @@ def work_iran(conn):
 
 
 # --------------------------------------------------------------------- sending
+async def _delete(bot, chat_id: int, msg_id: int | None) -> None:
+    if not msg_id:
+        return
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+    except Exception as e:                                   # noqa: BLE001
+        log.info("could not delete message %s in %s: %s", msg_id, chat_id, e)
+
+
 async def send_page(bot, conn, chat_id: int, page: str, now: float,
                     force: bool = False) -> str:
     """Create or edit this chat's one message. Returns 'sent' | 'edited' | 'skipped'.
 
-    The DB/render half runs in a thread; only the Telegram call is awaited on the
-    loop. The chat row is created if missing — otherwise the msg_id we store matches
-    zero rows and every later call posts a NEW message instead of editing.
+    The OHLC page goes out as an IMAGE: six full-width columns cannot stay a table at
+    a phone's monospace width, so rows wrap and the columns collapse (the user's
+    complaint, verbatim). Telegram cannot turn a text message into a photo or back,
+    so when the page type changes the new message is sent FIRST and the old one
+    deleted only after it succeeds — never the other way round, or a failed send
+    would leave the chat with nothing.
+
+    The quiet-hours signature is computed from the text page even when an image is
+    about to be sent, so the "nothing changed" test stays data-based and is not
+    defeated by the timestamp drawn inside the picture.
     """
     def prep():
         with S.lock:
             ch = S.get_chat(conn, chat_id)
             if not ch:
+                # A chat with no row would take our stored msg_id into nothing, and
+                # every later call would post a NEW message instead of editing.
                 S.upsert_chat(conn, chat_id)
                 ch = S.get_chat(conn, chat_id) or {}
-            sig = P.signature(conn, page, now)
             state = {}
             if ch.get("state_json"):
                 try:
                     state = json.loads(ch["state_json"])
                 except (ValueError, TypeError):
                     state = {}
-            quiet = P.all_closed(conn, page, now) and state.get("sig") == sig
-            if quiet and not force:
-                return "skipped", None, None, None, False
-            text = P.render(conn, page, now)
-            kb = keyboard(page)
-            S.set_chat(conn, chat_id, page=page)
-            state.update({"sig": sig, "page": page})
-            S.set_chat(conn, chat_id, state_json=json.dumps(state))
-            return "go", text, kb, ch.get("msg_id"), True
+            sig = P.signature(conn, page, now)
+            if P.all_closed(conn, page, now) and state.get("sig") == sig and not force:
+                return {"action": "skipped"}
+            media = imagetable.render_ohlc(conn, now) if page == P.PAGE_OHLC else None
+            text = P.ohlc_caption(conn, now) if media else P.render(conn, page, now)
+            return {"action": "go", "text": text, "kb": keyboard(page),
+                    "msg_id": ch.get("msg_id"), "media": media,
+                    "was_media": bool(state.get("media")), "sig": sig}
 
-    action, text, kb, msg_id, _keep = await asyncio.to_thread(prep)
-    if action == "skipped":
+    plan = await asyncio.to_thread(prep)
+    if plan["action"] == "skipped":
         return "skipped"
-    if msg_id:
+
+    def remember(msg_id=None, media=None):
+        with S.lock:
+            st = {"sig": plan["sig"], "page": page, "media": bool(media)}
+            S.set_chat(conn, chat_id, page=page, state_json=json.dumps(st))
+            if msg_id:
+                S.set_chat(conn, chat_id, msg_id=msg_id)
+
+    if plan["media"] is not None:
+        if plan["msg_id"] and plan["was_media"]:
+            try:
+                await bot.edit_message_media(
+                    chat_id=chat_id, message_id=plan["msg_id"],
+                    media=InputMediaPhoto(plan["media"], caption=plan["text"],
+                                          parse_mode=ParseMode.HTML),
+                    reply_markup=plan["kb"])
+                remember(media=True)
+                return "edited"
+            except BadRequest as e:
+                if "not modified" in str(e).lower():
+                    remember(media=True)
+                    return "skipped"
+                log.warning("media edit failed for %s (%s); sending a fresh photo",
+                            chat_id, e)
+        msg = await bot.send_photo(chat_id=chat_id, photo=plan["media"],
+                                   caption=plan["text"], reply_markup=plan["kb"],
+                                   parse_mode=ParseMode.HTML)
+        await _delete(bot, chat_id, plan["msg_id"])
+        remember(msg.message_id, media=True)
+        return "sent"
+
+    if plan["msg_id"] and plan["was_media"]:
+        # text cannot be edited into media: post the text, then drop the old photo
+        msg = await bot.send_message(chat_id=chat_id, text=plan["text"],
+                                     reply_markup=plan["kb"], parse_mode=ParseMode.HTML,
+                                     disable_web_page_preview=True)
+        await _delete(bot, chat_id, plan["msg_id"])
+        remember(msg.message_id, media=False)
+        return "sent"
+
+    if plan["msg_id"]:
         try:
-            await bot.edit_message_text(text=text, chat_id=chat_id, message_id=msg_id,
-                                        reply_markup=kb, parse_mode=ParseMode.HTML)
+            await bot.edit_message_text(text=plan["text"], chat_id=chat_id,
+                                        message_id=plan["msg_id"],
+                                        reply_markup=plan["kb"],
+                                        parse_mode=ParseMode.HTML)
+            remember(media=False)
             return "edited"
         except BadRequest as e:
             if "not modified" in str(e).lower():
+                remember(media=False)
                 return "skipped"
             log.warning("edit failed for %s (%s); sending a fresh message", chat_id, e)
-    msg = await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb,
-                                 parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    with S.lock:
-        S.set_chat(conn, chat_id, msg_id=msg.message_id)
+    msg = await bot.send_message(chat_id=chat_id, text=plan["text"],
+                                 reply_markup=plan["kb"], parse_mode=ParseMode.HTML,
+                                 disable_web_page_preview=True)
+    remember(msg.message_id, media=False)
     return "sent"
 
 
